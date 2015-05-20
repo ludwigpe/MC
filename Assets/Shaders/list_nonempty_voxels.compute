@@ -1,0 +1,77 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWStructuredBuffer<uint> nonemptyList;
+RWBuffer<uint> indexCounter;
+RWBuffer<uint> numVerts;
+RWBuffer<uint> numTris;
+StructuredBuffer<int> case_to_numpolys;
+
+Texture3D<float> densityTexture;
+SamplerState _LinearClamp;
+
+float invVoxelDim;
+float3 localToTextureCoord(float3 localCoord)
+{
+	
+	float3 uvw = localCoord;
+	uvw.y = 1 - uvw.y;
+	return uvw;
+}
+
+int calcNumVerts(int caseNumber)
+{
+	// extract bits 0,3,1 and 4 to see which are inside and outside the volume.
+	int  bit0 = (caseNumber     ) & 1;
+	int  bit3 = (caseNumber >> 3) & 1;
+	int  bit1 = (caseNumber >> 1) & 1;
+	int  bit4 = (caseNumber >> 4) & 1;
+	// since all edges that we are interested in go out from corner 0 we check
+	// if vertex 3,1,4 are different from vertex 0. If they are we should build a vertex on that edge
+	int3 build_vert_on_edge = abs( int3(bit3,bit1,bit4) - bit0.xxx );
+	int numVerts = build_vert_on_edge.x + build_vert_on_edge.y + build_vert_on_edge.z;
+	return numVerts;
+}
+
+[numthreads(33,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    
+	float cellDensity[8];	// density values at each corner of the voxel/cell (local to each thread)
+	float3 localCoords[8];	// local coordinates for each corner within the chunk (local to each thread)
+	
+	// lower left corners local coordinate
+	float3 localCoordLL = (float3)(id * invVoxelDim);
+	localCoords[0] = localCoordLL;											// v0 - lower left
+	localCoords[1] = localCoordLL + float3(0, invVoxelDim, 0);				// v1 - upper left
+	localCoords[2] = localCoordLL + float3(invVoxelDim, invVoxelDim, 0);	// v2 - upper right
+	localCoords[3] = localCoordLL + float3(invVoxelDim, 0, 0);				// v3 - lower right
+
+	localCoords[4] = localCoordLL + float3(0, 0, invVoxelDim);						// v4 - lower back left
+	localCoords[5] = localCoordLL + float3(0, invVoxelDim, invVoxelDim);			// v5 - upper back left
+	localCoords[6] = localCoordLL + float3(invVoxelDim, invVoxelDim, invVoxelDim);	// v6 - upper back right
+	localCoords[7] = localCoordLL + float3(invVoxelDim, 0, invVoxelDim);			// v7 - lower back right
+
+	int caseNumber = 0;
+	for (int i = 0; i < 8; i++)
+	{
+		float3 sampCoord = localToTextureCoord(localCoords[i]);
+		cellDensity[i] = densityTexture.SampleLevel(_LinearClamp, sampCoord, 0);
+		if( cellDensity[i] >= 0) caseNumber |= 1 << i;
+	}
+	// make sure caseNumber is not 0 or 255
+	if (caseNumber * (255-caseNumber) > 0)	// make sure case number is [1-254]
+	{
+		uint index = 0;
+		InterlockedAdd(indexCounter[0], 1, index);	// add 1 and return old val in index
+		uint z8_y8_x8_case8 = (id.z << 24) |		// bitshift and concatenate 
+                       (id.y << 16) |
+                       (id.x <<  8) |
+                       (caseNumber         );
+		nonemptyList[index] = z8_y8_x8_case8;		// write integer to nonempty list
+		int nv = calcNumVerts(caseNumber);
+		InterlockedAdd(numVerts[0], nv, index);
+		if( id.x < 32 && id.y < 32 && id.z < 32) // check that it is a cell that is inside the chunk and not the extra row.
+			InterlockedAdd(numTris[0], case_to_numpolys[caseNumber], index);
+	}
+}
